@@ -1,5 +1,6 @@
-transformers==4.43.3
+transformers==4.45.2
 trl
 liger-kernel
-torch
 triton
+torch
+torchvision

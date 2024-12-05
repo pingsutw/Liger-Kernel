@@ -11,7 +11,12 @@ from liger_kernel.ops.utils import (
 )
 
 if compare_version("triton", operator.ge, "3.0.0"):
-    from triton.language.extra.libdevice import tanh
+    try:
+        # typical import path with dispatch available
+        from triton.language.extra.libdevice import tanh
+    except ModuleNotFoundError:
+        # for working with NGC containers
+        from triton.language.extra.cuda.libdevice import tanh
 else:
     from triton.language.math import tanh
 
@@ -20,7 +25,7 @@ else:
 def _geglu_tanh_forward_kernel(
     a, b, c, stride, n_cols: tl.constexpr, BLOCK_SIZE: tl.constexpr
 ):
-    program_id = tl.program_id(0)
+    program_id = tl.program_id(0).to(tl.int64)
 
     # locate start index
     a += program_id * stride
@@ -47,7 +52,7 @@ def _geglu_tanh_forward_kernel(
 def _geglu_tanh_backward_kernel(
     dc, a, b, stride, n_cols: tl.constexpr, BLOCK_SIZE: tl.constexpr
 ):
-    program_id = tl.program_id(0)
+    program_id = tl.program_id(0).to(tl.int64)
 
     # locate start index
     dc += program_id * stride
@@ -87,54 +92,61 @@ def _geglu_tanh_backward_kernel(
     tl.store(b + col_offsets, db_row, mask=mask)
 
 
+def geglu_forward(a, b):
+    ori_shape = a.shape
+
+    n_cols = ori_shape[-1]
+    a = a.view(-1, n_cols)
+    b = b.view(-1, n_cols)
+    c = torch.empty_like(a)
+    n_rows = a.shape[0]
+
+    BLOCK_SIZE, num_warps = calculate_settings(n_cols)
+
+    _geglu_tanh_forward_kernel[(n_rows,)](
+        a,
+        b,
+        c,
+        c.stride(-2),
+        n_cols=n_cols,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=num_warps,
+    )
+    return a, b, c.view(*ori_shape)
+
+
+def geglu_backward(a, b, dc):
+    ori_shape = dc.shape
+    n_cols = ori_shape[-1]
+    dc = dc.view(-1, n_cols)
+    n_rows = dc.shape[0]
+
+    BLOCK_SIZE, num_warps = calculate_settings(n_cols)
+
+    _geglu_tanh_backward_kernel[(n_rows,)](
+        dc,
+        a,
+        b,
+        dc.stride(-2),
+        n_cols=n_cols,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=num_warps,
+    )
+
+    return a.view(*ori_shape), b.view(*ori_shape)
+
+
 class LigerGELUMulFunction(torch.autograd.Function):
     @staticmethod
     @ensure_contiguous
     def forward(ctx, a, b):
-        ori_shape = a.shape
-
-        n_cols = ori_shape[-1]
-        a = a.view(-1, n_cols)
-        b = b.view(-1, n_cols)
-        c = torch.zeros_like(a)
-        n_rows = a.shape[0]
-
-        BLOCK_SIZE, num_warps = calculate_settings(n_cols)
-
-        _geglu_tanh_forward_kernel[(n_rows,)](
-            a,
-            b,
-            c,
-            c.stride(-2),
-            n_cols=n_cols,
-            BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=num_warps,
-        )
-
+        a, b, c = geglu_forward(a, b)
         ctx.save_for_backward(a, b)
-
-        return c.view(*ori_shape)
+        return c
 
     @staticmethod
     @ensure_contiguous
     def backward(ctx, dc):
-
-        ori_shape = dc.shape
-        n_cols = ori_shape[-1]
-        dc = dc.view(-1, n_cols)
         a, b = ctx.saved_tensors
-        n_rows = dc.shape[0]
-
-        BLOCK_SIZE, num_warps = calculate_settings(n_cols)
-
-        _geglu_tanh_backward_kernel[(n_rows,)](
-            dc,
-            a,
-            b,
-            dc.stride(-2),
-            n_cols=n_cols,
-            BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=num_warps,
-        )
-
-        return a.view(*ori_shape), b.view(*ori_shape)
+        a, b = geglu_backward(a, b, dc)
+        return a, b

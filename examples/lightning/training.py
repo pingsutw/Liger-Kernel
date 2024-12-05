@@ -11,32 +11,31 @@ from lightning.pytorch.strategies import DeepSpeedStrategy, FSDPStrategy
 from torch.distributed.fsdp import BackwardPrefetch, MixedPrecision
 from torch.utils.data import DataLoader
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
 from trl import DataCollatorForCompletionOnlyLM
 
-from liger_kernel.transformers import apply_liger_kernel_to_llama
-
-apply_liger_kernel_to_llama(fused_linear_cross_entropy=True, cross_entropy=False)
-
+from liger_kernel.transformers import AutoLigerKernelForCausalLM
+from liger_kernel.utils import infer_device
 
 _RETAIN_COLUMNS = {"input_ids", "attention_mask", "labels"}
 QUESTION = "<Question>"
 CHOICES = "<Choices>"
-ANSWER = "<Answer>"
 
 
 @dataclass
 class Args:
-    model: str = "meta-llama/Meta-Llama-3-8B"
+    model: str = "Qwen/Qwen2-0.5B-Instruct"
     data: str = "cais/mmlu"
     output_dir: str = "mmlu_finetuning"
     max_length: int = 2048
-    # deepspeed will OOM with 16
-    batch_size: int = 8
+    # for llam3 8B model, deepspeed will OOM with 16 on 8XA100 80G and 8 will OOM with 8XA100 40G
+    batch_size: int = 4
     lr: float = 6e-6
     weight_decay: float = 0.05
     warmup_ratio: float = 0.1
     seed: int = 42
-    strategy: str = "deepspeed"
+    strategy: str = "auto"
+    num_gpu: int = None
 
 
 def warmup_cosine_schedule(warmup_steps, total_steps, min_lr=0):
@@ -75,7 +74,7 @@ class LanguageModel(pl.LightningModule):
         # https://lightning.ai/docs/pytorch/stable/advanced/model_parallel/fsdp.html#speed-up-model-initialization
         if self.model is not None:
             return
-        self.model = transformers.AutoModelForCausalLM.from_pretrained(
+        self.model = AutoLigerKernelForCausalLM.from_pretrained(
             self.args.model, use_cache=False, ignore_mismatched_sizes=True
         )
         if self.args.strategy == "deepspeed":
@@ -148,7 +147,10 @@ class DataModule(pl.LightningDataModule):
         super().__init__()
         self.args = args
         self.tokenizer = tokenizer
-        response_prompt = tokenizer.encode(f" {ANSWER}", add_special_tokens=False)
+        self.response_template_str = " <Answer>"
+        response_prompt = tokenizer.encode(
+            f"{self.response_template_str}", add_special_tokens=False
+        )
         self.collator = DataCollatorForCompletionOnlyLM(
             tokenizer=tokenizer,
             response_template=response_prompt,
@@ -164,7 +166,7 @@ class DataModule(pl.LightningDataModule):
             s = "Below is a question and multiple choice answers, choices separated by a semicolon. Please select the best answer for the question. "
             s += f"{QUESTION}{example['question'][i]} "
             s += f"{CHOICES}{choices} "
-            s += f"{ANSWER}{example['answer'][i]}"
+            s += f"{self.response_template_str}{example['answer'][i]}"
             output_texts.append(s)
         return output_texts
 
@@ -182,6 +184,16 @@ class DataModule(pl.LightningDataModule):
 
     def setup(self, stage) -> None:
         dataset = datasets.load_dataset(self.args.data, "auxiliary_train")
+        flattened_data = [
+            {
+                "answer": x["train"]["answer"],
+                "choices": x["train"]["choices"],
+                "question": x["train"]["question"],
+                "subject": x["train"]["subject"],
+            }
+            for x in dataset["train"]
+        ]
+        dataset = datasets.Dataset.from_list(flattened_data)
         dataset = dataset.train_test_split(test_size=4096, seed=self.args.seed)
         train_dataset, val_dataset = dataset["train"], dataset["test"]
         self.train_dataset = train_dataset.map(
@@ -219,7 +231,16 @@ def train():
     pl.seed_everything(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    layers = {LlamaDecoderLayer}
+    if "Meta-Llama-3-8B" in args.model:
+        layers = {LlamaDecoderLayer}
+    elif "Qwen2" in args.model:
+        layers = {Qwen2DecoderLayer}
+    else:
+        layers = {}
+        raise Warning(
+            f"Unimplemented layer wrap policy for {args.model} in this example"
+        )
+
     if args.strategy == "fsdp":
         strategy = FSDPStrategy(
             auto_wrap_policy=layers,
@@ -232,16 +253,30 @@ def train():
             ),
             forward_prefetch=True,
         )
-    else:
+        precision = None
+    elif args.strategy == "deepspeed":
         strategy = DeepSpeedStrategy(stage=3)
+        precision = "bf16-mixed"
+    elif args.strategy == "ddp":
+        strategy = "ddp"
+        precision = "bf16-true"
+    else:
+        strategy = "auto"
+        precision = "bf16-true"
+
+    device = infer_device()
     trainer = pl.Trainer(
-        accelerator="cuda",
+        accelerator=device,
         strategy=strategy,
-        devices=torch.cuda.device_count(),
+        devices=(
+            getattr(torch, device).device_count()
+            if args.num_gpu is None
+            else args.num_gpu
+        ),
         default_root_dir=args.output_dir,
         log_every_n_steps=1,
         max_epochs=1,
-        precision=None if args.strategy == "fsdp" else "bf16-mixed",
+        precision=precision,
     )
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
