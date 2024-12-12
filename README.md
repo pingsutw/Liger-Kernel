@@ -44,7 +44,6 @@
     </tr>
 </table>
 
-<img src="./docs/images/logo-banner.jpeg">
 
 
 <img src="https://raw.githubusercontent.com/linkedin/Liger-Kernel/main/docs/images/logo-banner.png">
