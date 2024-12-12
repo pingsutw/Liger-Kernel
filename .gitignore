@@ -17,3 +17,6 @@ uv.lock
 
 # Benchmark images
 benchmark/visualizations
+
+# IDE
+.idea
